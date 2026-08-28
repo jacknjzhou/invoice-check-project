@@ -20,6 +20,8 @@ export interface Invoice {
   amount_total?: number
   seller_name?: string
   buyer_name?: string
+  seller_tax_id?: string
+  buyer_tax_id?: string
   items?: Array<{ name: string; amount: number }>
   remark?: string
   duplicate_of_id?: number

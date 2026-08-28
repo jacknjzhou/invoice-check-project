@@ -15,6 +15,19 @@ from ..models import Setting
 logger = logging.getLogger(__name__)
 
 
+def _snip_json(text: str) -> str | None:
+    """从文本中截取第一个 { 到最后一个 } 的 JSON 片段。
+
+    用于 reasoning 类模型：思考过程里若包含最终 JSON，
+    只返回该片段；不含 JSON 则返回 None。
+    """
+    start = text.find("{")
+    end = text.rfind("}")
+    if start != -1 and end > start:
+        return text[start : end + 1]
+    return None
+
+
 def _detect_default_base_url() -> str:
     """根据运行环境自动推断 Ollama base_url。
 
@@ -107,13 +120,18 @@ async def chat_completion(
     max_tokens: int = 2048,
     timeout: float = 180.0,
     retries: int = 2,
+    json_mode: bool = False,
 ) -> str:
     """调用 OpenAI 兼容 chat 接口，返回文本内容。失败抛出 RuntimeError。
 
+    json_mode=True 时附加 ``response_format: {"type": "json_object"}``，
+    OpenAI / DashScope / 新版 Ollama 均支持；若服务端拒绝该参数，
+    会自动去掉后重试，保证兼容旧模型。
+
     兼容性说明：部分模型（如 gemma4）会把"思考过程"放在非标准的
     ``reasoning`` 字段，``content`` 仍可能为空。本函数会优先返回
-    ``content``，若为空则回退到 ``reasoning``，避免被截断到
-    思考过程的模型输出空白。
+    ``content``，若为空则回退到 ``reasoning`` 中的 JSON 片段，避免
+    被截断到思考过程的模型输出空白。
     """
     cfg = cfg or get_llm_config()
     model = model or cfg.get("chat_model")
@@ -121,15 +139,18 @@ async def chat_completion(
     headers = {"Content-Type": "application/json"}
     if cfg.get("api_key"):
         headers["Authorization"] = f"Bearer {cfg['api_key']}"
-    payload = {
-        "model": model,
-        "messages": messages,
-        "temperature": temperature,
-        "max_tokens": max_tokens,
-    }
 
+    use_response_format = json_mode
     last_err: Exception | None = None
     for attempt in range(retries + 1):
+        payload: dict = {
+            "model": model,
+            "messages": messages,
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+        }
+        if use_response_format:
+            payload["response_format"] = {"type": "json_object"}
         try:
             async with httpx.AsyncClient(timeout=timeout) as client:
                 resp = await client.post(url, headers=headers, json=payload)
@@ -139,10 +160,24 @@ async def chat_completion(
                 # 1) 标准 OpenAI 字段
                 content = msg.get("content")
                 # 2) reasoning 类模型的非标准字段（Ollama 上 gemma4 等会把
-                #    思考过程放在这里；如果 content 已被截断为空，尝试用 reasoning）
+                #    思考过程放在这里；如果 content 已被截断为空，尝试用
+                #    reasoning 中可解析出的 JSON 片段，避免把思考过程当结果）
                 if not content:
-                    content = msg.get("reasoning", "")
+                    reasoning = msg.get("reasoning", "")
+                    if reasoning:
+                        content = _snip_json(reasoning) or ""
                 return content or ""
+        except httpx.HTTPStatusError as e:
+            last_err = e
+            # 服务端不认识 response_format（常见于旧版 Ollama/vLLM），
+            # 去掉该参数重试
+            if use_response_format and e.response.status_code in (400, 422):
+                logger.warning("服务端不支持 response_format，回退为普通文本模式")
+                use_response_format = False
+                continue
+            logger.warning("LLM 调用失败(第 %d 次): %s", attempt + 1, e)
+            if attempt < retries:
+                await asyncio.sleep(2 * (attempt + 1))
         except Exception as e:  # noqa: BLE001
             last_err = e
             logger.warning("LLM 调用失败(第 %d 次): %s", attempt + 1, e)

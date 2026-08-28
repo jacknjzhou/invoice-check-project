@@ -22,6 +22,8 @@ EXTRACT_PROMPT = """你是一名专业的发票识别助手。请仔细识别图
    - amount_total: 价税合计/小写金额（数字）
    - seller_name: 销售方/商户名称
    - buyer_name: 购买方名称
+   - seller_tax_id: 销售方纳税人识别号（统一社会信用代码，大写字母+数字，无空格，识别不出则 null）
+   - buyer_tax_id: 购买方纳税人识别号（同上格式，识别不出则 null）
    - items: 商品/服务明细，数组，每项为 {"name": 商品名称, "amount": 金额}，无则 []
    - remark: 备注栏内容，无则 null
 3. 数字只保留数值（如 123.45），不要带"元"、"¥"等单位。
@@ -31,7 +33,7 @@ EXTRACT_PROMPT = """你是一名专业的发票识别助手。请仔细识别图
 
 只输出一个 JSON 对象，不要输出任何解释、前后缀或 markdown 代码块标记。
 参考输出JSON格式示例：
-{"invoice_type":"","invoice_code":"","invoice_number":"","issue_date":"","amount_ex_tax":100.0,"tax_amount":0,"amount_total":0,"seller_name":"","buyer_name":"","items":[{"name":"","amount":100.0}],"remark":null}
+{"invoice_type":"","invoice_code":"","invoice_number":"","issue_date":"","amount_ex_tax":100.0,"tax_amount":0,"amount_total":0,"seller_name":"","buyer_name":"","seller_tax_id":"","buyer_tax_id":"","items":[{"name":"","amount":100.0}],"remark":null}
 """
 
 
@@ -68,11 +70,19 @@ async def extract_invoice(
     *,
     cfg: dict | None = None,
     model: str | None = None,
-) -> dict:
+    return_raw: bool = False,
+) -> dict | tuple[dict, str]:
     """将发票图片送入视觉模型，返回结构化的发票字段 dict。
-    
+
     使用单次提取，简单可靠。
+    return_raw=True 时返回 (parsed, raw) 元组，raw 为模型原始输出。
+    默认使用配置中的 extract_model（而非 chat_model）。
     """
+    if cfg is None:
+        from .client import get_llm_config
+        cfg = get_llm_config()
+    model = model or cfg.get("extract_model") or cfg.get("chat_model")
+
     messages = [
         {
             "role": "user",
@@ -91,20 +101,21 @@ async def extract_invoice(
         }
     ]
     raw = await chat_completion(
-        messages, cfg=cfg, model=model, temperature=0.0, max_tokens=2048
+        messages, cfg=cfg, model=model, temperature=0.0, max_tokens=2048,
+        json_mode=True,
     )
-    
+
     # 记录模型原始输出
     logger.info("模型原始输出:\n%s", raw)
-    
+
     parsed = _extract_json(raw)
     if parsed is None:
         raise RuntimeError(f"模型输出无法解析为 JSON: {raw[:200]}")
-    
+
     # 记录解析后的结构化数据
     logger.info("解析后的发票数据:\n%s", json.dumps(parsed, ensure_ascii=False, indent=2))
-    
-    return parsed
+
+    return (parsed, raw) if return_raw else parsed
 
 
 def to_b64(data: bytes) -> str:

@@ -22,7 +22,7 @@ wheels/
 *.egg-info/
 .installed.cfg
 *.egg
-
+.trae/
 # Node
 node_modules/
 npm-debug.log*

@@ -13,6 +13,9 @@ psycopg2-binary>=2.9
 # OCR：使用 RapidOCR（基于 ONNX Runtime），跨架构稳定，无需 PaddlePaddle
 # 解决 PaddlePaddle 3.x 在 aarch64 (Apple Silicon Docker) 上的 C++ 段错误问题
 rapidocr-onnxruntime>=1.4
+# 发票二维码解析（pyzbar 需要系统库 libzbar0 / brew install zbar）
+# cv2 兜底引擎复用 RapidOCR 间接安装的 opencv，无需重复声明
+pyzbar>=0.1.9
 # 系统依赖（需单独安装）
-# macOS: brew install poppler
-# Ubuntu/Debian: apt-get install poppler-utils libgl1 libglib2.0-0 libxcb1
+# macOS: brew install poppler zbar
+# Ubuntu/Debian: apt-get install poppler-utils libgl1 libglib2.0-0 libxcb1 libzbar0

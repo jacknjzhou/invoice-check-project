@@ -1,15 +1,17 @@
-"""发票处理管线：PDF 转图 → 视觉提取 → 查重 → 入库。"""
+"""发票处理管线：PDF 转图 → 视觉提取 → QR 校正 → 查重 → 入库。"""
 import asyncio
 import logging
 from pathlib import Path
 from PIL import Image
 from pdf2image import convert_from_path
+from sqlalchemy.exc import IntegrityError
 
 from ..database import SessionLocal
 from ..llm.extractor import extract_invoice, to_b64
 from ..llm.extractor_v2 import extract_with_ocr
 from ..services.ocr_service import check_paddleocr
-from ..models import Invoice
+from ..services.qr_service import decode_invoice_qr
+from ..models import Invoice, ExtractionRun
 from .dedup import check_duplicate
 
 logger = logging.getLogger(__name__)
@@ -159,6 +161,14 @@ def validate_and_fix_fields(fields: dict) -> dict:
             except (ValueError, TypeError):
                 # 转换失败时保留原值
                 pass
+
+    # 3.5 纳税人识别号清洗：去空格/分隔符，统一大写
+    for key in ("seller_tax_id", "buyer_tax_id"):
+        if fields.get(key):
+            cleaned = re.sub(r"[\s\-—－]", "", str(fields[key])).upper()
+            if cleaned != fields[key]:
+                logger.info("纳税人识别号清洗 %s: '%s' -> '%s'", key, fields[key], cleaned)
+            fields[key] = cleaned
     
     # 4. 金额勾稽校验：仅记录警告，不修改原值
     ex_tax = fields.get("amount_ex_tax")
@@ -194,7 +204,8 @@ def merge_extracted_fields(results: list[dict]) -> dict:
     keys = [
         "invoice_type", "invoice_code", "invoice_number", "issue_date",
         "amount_ex_tax", "tax_amount", "amount_total",
-        "seller_name", "buyer_name", "items", "remark",
+        "seller_name", "buyer_name", "seller_tax_id", "buyer_tax_id",
+        "items", "remark",
     ]
     
     for k in keys:
@@ -228,6 +239,200 @@ def merge_extracted_fields(results: list[dict]) -> dict:
     return merged
 
 
+def apply_qr_anchor(fields: dict, qr: dict | None) -> dict:
+    """用 QR 码解码结果作为锚点，交叉校验/修正提取字段。
+
+    QR 码是票据上的机器可读数据源，优先级高于 OCR/LLM 提取：
+    - 提取字段为空 → 用 QR 补齐
+    - 提取字段与 QR 冲突 → 以 QR 为准（记录警告日志）
+    """
+    if not qr:
+        return fields
+
+    key_map = {
+        "invoice_code": "invoice_code",
+        "invoice_number": "invoice_number",
+        "issue_date": "issue_date",
+        "amount_total": "amount_total",
+    }
+    for field, qr_key in key_map.items():
+        qr_val = qr.get(qr_key)
+        if qr_val is None:
+            continue
+        cur_val = fields.get(field)
+        if cur_val in (None, "", []):
+            fields[field] = qr_val
+            logger.info("QR 锚点补齐 %s: %s", field, qr_val)
+        elif str(cur_val) != str(qr_val):
+            logger.warning(
+                "QR 锚点修正 %s: 提取值 '%s' -> QR 值 '%s'",
+                field, cur_val, qr_val,
+            )
+            fields[field] = qr_val
+    return fields
+
+
+def check_fields_sanity(fields: dict) -> list[str]:
+    """对提取结果做完整性/一致性自检，返回问题列表（空列表表示通过）。
+
+    检查项：关键系数完整性、格式合法性、金额勾稽一致性。
+    """
+    issues: list[str] = []
+
+    number = fields.get("invoice_number")
+    if not number:
+        issues.append("缺少发票号码")
+    elif not str(number).isdigit():
+        issues.append(f"发票号码含非数字字符: {number}")
+
+    code = fields.get("invoice_code")
+    if not code and (not number or len(str(number)) != 20):
+        # 无代码时仅全电发票（20 位号码）可接受
+        issues.append("缺少发票代码（且号码非全电 20 位格式）")
+
+    date = fields.get("issue_date")
+    if not date:
+        issues.append("缺少开票日期")
+    else:
+        try:
+            from datetime import datetime
+            datetime.strptime(str(date), "%Y-%m-%d")
+        except ValueError:
+            issues.append(f"开票日期格式异常: {date}")
+
+    total = fields.get("amount_total")
+    if total is None:
+        issues.append("缺少价税合计")
+    elif not isinstance(total, (int, float)) or total <= 0:
+        issues.append(f"价税合计异常: {total}")
+
+    ex_tax, tax = fields.get("amount_ex_tax"), fields.get("tax_amount")
+    if None not in (ex_tax, tax, total) and isinstance(total, (int, float)):
+        if abs(float(ex_tax) + float(tax) - float(total)) > 0.5:
+            issues.append(f"金额勾稽不一致: {ex_tax} + {tax} ≠ {total}")
+
+    return issues
+
+
+async def extract_invoice_fields(
+    file_path: Path,
+    *,
+    use_ocr: bool | None = None,
+    model: str | None = None,
+) -> dict:
+    """对单个发票文件执行完整提取管线（不含查重/入库）。
+
+    流程：PDF 转图 → 逐页提取（OCR+LLM 优先）→ 合并 → QR 锚点校正
+    → 字段清洗 → 完整性自检 → 自检失败时用视觉模型二次提取交叉校验。
+
+    Args:
+        file_path: 发票文件（图片或 PDF）
+        use_ocr: 是否优先使用 OCR 模式，None 时自动检测
+        model: 指定提取模型，None 时使用配置中的 extract_model
+
+    Returns:
+        {"fields": dict, "issues": list[str], "raw_outputs": list[str],
+         "mode": str, "model": str}
+    """
+    if use_ocr is None:
+        use_ocr = check_paddleocr()
+
+    if file_path.suffix.lower() == ".pdf":
+        img_dir = file_path.parent / f"{file_path.stem}_pages"
+        img_paths = pdf_to_images(file_path, img_dir)
+    else:
+        img_paths = [file_path]
+
+    from ..llm.client import get_llm_config
+    cfg = get_llm_config()
+    model = model or cfg.get("extract_model") or cfg.get("chat_model")
+
+    async def run_page(img_path: Path, ocr: bool) -> tuple[dict, str]:
+        """提取单页，OCR 失败自动回退视觉模式。返回 (fields, raw)。"""
+        if ocr:
+            try:
+                return await extract_with_ocr(img_path, cfg=cfg, model=model, return_raw=True)
+            except Exception as e:
+                logger.warning("OCR 模式失败，回退到视觉模型: %s", e)
+        b64, mime = image_to_b64(img_path)
+        return await extract_invoice(b64, mime, cfg=cfg, model=model, return_raw=True)
+
+    async def merge_all(pages: list[Path]) -> tuple[dict, list]:
+        """逐页提取 → 合并 → QR 校正 → 清洗校验。返回 (merged, raws)。"""
+        results, raws = [], []
+        for img_path in pages:
+            try:
+                extracted, raw = await run_page(img_path, use_ocr)
+                results.append(extracted)
+                raws.append(raw)
+                logger.info("文件 %s 提取结果: %s", img_path.name, extracted)
+            except Exception as e:
+                logger.warning("提取失败 %s: %s", img_path, e)
+                results.append({})
+                raws.append("")
+
+        merged = merge_extracted_fields(results)
+
+        # QR 码锚点校验/修正（机器可读数据源，优先级高于 OCR/LLM 提取）
+        try:
+            qr = decode_invoice_qr(img_paths[0])
+        except Exception as qr_err:
+            logger.warning("QR 解码异常: %s", qr_err)
+            qr = None
+        if qr:
+            merged = apply_qr_anchor(merged, qr)
+
+        merged = validate_and_fix_fields(merged)
+        return merged, raws
+
+    logger.info("开始提取 %s，模式: %s", file_path.name, "OCR+LLM" if use_ocr else "纯视觉")
+    merged, raws = await merge_all(img_paths)
+
+    # 完整性自检；失败时用另一通道（视觉模型）二次提取交叉校验
+    issues = check_fields_sanity(merged)
+    if issues and use_ocr:
+        logger.warning("自检发现问题 %s，启动视觉模型二次提取交叉校验", issues)
+        second_results, second_raws = [], []
+        for img_path in img_paths:
+            try:
+                extracted, raw = await run_page(img_path, ocr=False)
+                second_results.append(extracted)
+                second_raws.append(raw)
+            except Exception as e:
+                logger.warning("第二通道提取失败 %s: %s", img_path, e)
+                second_results.append({})
+                second_raws.append("")
+
+        second_merged = merge_extracted_fields(second_results)
+        second_merged = validate_and_fix_fields(second_merged)
+        second_issues = check_fields_sanity(second_merged)
+
+        if len(second_issues) < len(issues):
+            logger.info(
+                "采用第二通道结果（问题数 %d -> %d）", len(issues), len(second_issues)
+            )
+            # 以第二通道为主，第一通道的非空字段补齐缺失项
+            for k, v in merged.items():
+                if second_merged.get(k) in (None, "", []) and v not in (None, "", []):
+                    second_merged[k] = v
+            merged = second_merged
+            issues = second_issues
+            raws.extend(second_raws)
+            mode = "ocr_llm+vision"
+        else:
+            mode = "ocr_llm"
+    else:
+        mode = "ocr_llm" if use_ocr else "vision"
+
+    return {
+        "fields": merged,
+        "issues": issues,
+        "raw_outputs": raws,
+        "mode": mode,
+        "model": model,
+    }
+
+
 async def process_invoice(invoice_id: int) -> None:
     """处理单张发票：更新状态 → 提取 → 查重 → 入库。"""
     db = SessionLocal()
@@ -247,43 +452,22 @@ async def process_invoice(invoice_id: int) -> None:
             db.commit()
             return
 
-        # PDF 转图片
-        if inv.file_type == "pdf":
-            img_dir = file_path.parent / f"{file_path.stem}_pages"
-            img_paths = pdf_to_images(file_path, img_dir)
-        else:
-            img_paths = [file_path]
-
-        # 逐页提取（优先使用 OCR + LLM 混合模式，回退到纯视觉模型）
-        results = []
-        use_ocr = check_paddleocr()
-        logger.info("处理发票 %d，使用模式: %s", invoice_id, "OCR+LLM" if use_ocr else "纯视觉模型")
-
-        for img_path in img_paths:
-            try:
-                if use_ocr:
-                    try:
-                        extracted = await extract_with_ocr(img_path)
-                    except Exception as ocr_err:
-                        logger.warning("OCR 模式失败，回退到视觉模型: %s", ocr_err)
-                        b64, mime = image_to_b64(img_path)
-                        extracted = await extract_invoice(b64, mime)
-                else:
-                    b64, mime = image_to_b64(img_path)
-                    extracted = await extract_invoice(b64, mime)
-                results.append(extracted)
-                logger.info("文件 %s 提取结果: %s", img_path.name, extracted)
-            except Exception as e:
-                logger.warning("提取失败 %s: %s", img_path, e)
-                results.append({})
-        
-        # 合并字段
-        merged = merge_extracted_fields(results)
-        logger.info("合并后的字段: %s", merged)
-        
-        # 校验并修复字段
-        merged = validate_and_fix_fields(merged)
+        # 完整提取管线（含 QR 校正、自检、交叉校验）
+        out = await extract_invoice_fields(file_path)
+        merged = out["fields"]
+        if out["issues"]:
+            logger.warning("发票 %d 自检遗留问题: %s", invoice_id, out["issues"])
         logger.info("校验后的最终结果: %s", merged)
+
+        # 记录提取历史（换模型对比 / 审计追溯，reprocess 不覆盖）
+        db.add(ExtractionRun(
+            invoice_id=inv.id,
+            mode=out["mode"],
+            model=out["model"],
+            raw_output="\n---\n".join(out["raw_outputs"])[:10000],
+            fields=merged,
+            issues=out["issues"],
+        ))
 
         # 查重
         dup = check_duplicate(
@@ -308,10 +492,22 @@ async def process_invoice(invoice_id: int) -> None:
             inv.amount_total = merged.get("amount_total")
             inv.seller_name = merged.get("seller_name")
             inv.buyer_name = merged.get("buyer_name")
+            inv.seller_tax_id = merged.get("seller_tax_id")
+            inv.buyer_tax_id = merged.get("buyer_tax_id")
             inv.items = merged.get("items")
             inv.remark = merged.get("remark")
 
-        db.commit()
+        try:
+            db.commit()
+        except IntegrityError:
+            # 并发上传相同发票时触发 (invoice_code, invoice_number) 唯一约束
+            db.rollback()
+            logger.warning("发票 %d 触发唯一约束，标记为重复", invoice_id)
+            inv = db.query(Invoice).filter(Invoice.id == invoice_id).first()
+            if inv:
+                inv.status = "duplicate"
+                inv.error_msg = "发票代码+号码与已有发票冲突（唯一约束）"
+                db.commit()
         logger.info("发票 %d 处理完成: %s", invoice_id, inv.status)
 
     except Exception as e:

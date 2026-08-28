@@ -19,6 +19,8 @@ class InvoiceOut(BaseModel):
     amount_total: float | None = None
     seller_name: str | None = None
     buyer_name: str | None = None
+    seller_tax_id: str | None = None
+    buyer_tax_id: str | None = None
     items: list | None = None
     remark: str | None = None
     duplicate_of_id: int | None = None
@@ -45,6 +47,8 @@ class InvoiceUpdate(BaseModel):
     amount_total: float | None = None
     seller_name: str | None = None
     buyer_name: str | None = None
+    seller_tax_id: str | None = None
+    buyer_tax_id: str | None = None
     remark: str | None = None
 
 
