@@ -66,13 +66,14 @@ ollama pull qwen2.5vl:7b
 > **历史说明**：早期版本曾使用 PaddleOCR，但 PaddlePaddle 3.x 在 aarch64（Apple Silicon Docker）上存在 C++ 段错误，已迁移到 RapidOCR（基于 ONNX Runtime），跨架构稳定。
 
 LLM 模型（Ollama / OpenAI / DashScope 等）不在 Docker 中托管，而是由用户在宿主机或其他云端自行准备。`backend` 容器内通过 `host.docker.internal` 自动连接宿主机的 Ollama 服务。
+http://host.docker.internal:8899/v1
 
 ### 快速启动
 
 ```bash
-# 1. 启动宿主机 Ollama（或其他 LLM 服务）
+# 1. 启动宿主机 Ollama（或其他 LLM 服务oMLX）
 ollama serve  # 确保监听 0.0.0.0:11434
-ollama pull qwen2.5vl:7b
+ollama pull Qwen3.8-27B-4bit
 
 # 2. 启动所有容器服务（首次会自动下载 RapidOCR 模型，耗时较短）
 docker-compose up -d --build

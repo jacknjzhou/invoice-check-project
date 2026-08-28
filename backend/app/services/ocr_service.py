@@ -144,15 +144,15 @@ def group_by_region(
     return regions
 
 
-def format_item_for_prompt(item: Dict[str, Any]) -> str:
+def format_item_for_prompt(item: Dict[str, Any], img_width: int, img_height: int) -> str:
     """格式化 OCR 项为带位置信息的文本，供 LLM 使用。"""
     bbox = item.get("bbox", [])
     if not bbox or len(bbox) < 4:
         return f"  \"{item.get('text', '')}\" (置信度={item.get('confidence', 0):.2f})"
 
-    # 中心点坐标（归一化到 0-1000 范围，便于 LLM 理解）
-    cx = int(sum(p[0] for p in bbox) / len(bbox) * 1000)
-    cy = int(sum(p[1] for p in bbox) / len(bbox) * 1000)
+    # 中心点坐标（按图片尺寸归一化到 0-1000 范围，便于 LLM 理解）
+    cx = int(sum(p[0] for p in bbox) / len(bbox) / img_width * 1000)
+    cy = int(sum(p[1] for p in bbox) / len(bbox) / img_height * 1000)
     return f"  位置(x={cx},y={cy}): \"{item.get('text', '')}\" (置信度={item.get('confidence', 0):.2f})"
 
 
@@ -168,20 +168,20 @@ def build_ocr_context(img_path: Path) -> str:
     lines = []
     lines.append("【右上角区域 - 发票代码/号码/日期】")
     for item in regions["top_right"]:
-        lines.append(format_item_for_prompt(item))
+        lines.append(format_item_for_prompt(item, w, h))
 
     lines.append("\n【中部区域 - 金额/明细】")
     for item in regions["center"]:
-        lines.append(format_item_for_prompt(item))
+        lines.append(format_item_for_prompt(item, w, h))
 
     lines.append("\n【底部区域 - 销售方/购买方/备注】")
     for item in regions["bottom"]:
-        lines.append(format_item_for_prompt(item))
+        lines.append(format_item_for_prompt(item, w, h))
 
     if regions["left"]:
         lines.append("\n【左侧区域】")
         for item in regions["left"]:
-            lines.append(format_item_for_prompt(item))
+            lines.append(format_item_for_prompt(item, w, h))
 
     context = "\n".join(lines)
     logger.info("OCR 上下文构建完成，总字符数=%d", len(context))

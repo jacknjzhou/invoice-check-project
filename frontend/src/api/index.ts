@@ -20,6 +20,8 @@ export interface Invoice {
   amount_total?: number
   seller_name?: string
   buyer_name?: string
+  seller_tax_id?: string
+  buyer_tax_id?: string
   items?: Array<{ name: string; amount: number }>
   remark?: string
   duplicate_of_id?: number
@@ -46,6 +48,7 @@ export interface Setting {
   api_key: string
   extract_model: string
   chat_model: string
+  json_mode: boolean
 }
 
 export interface ChatResponse {

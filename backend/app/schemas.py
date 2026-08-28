@@ -19,6 +19,8 @@ class InvoiceOut(BaseModel):
     amount_total: float | None = None
     seller_name: str | None = None
     buyer_name: str | None = None
+    seller_tax_id: str | None = None
+    buyer_tax_id: str | None = None
     items: list | None = None
     remark: str | None = None
     duplicate_of_id: int | None = None
@@ -45,6 +47,8 @@ class InvoiceUpdate(BaseModel):
     amount_total: float | None = None
     seller_name: str | None = None
     buyer_name: str | None = None
+    seller_tax_id: str | None = None
+    buyer_tax_id: str | None = None
     remark: str | None = None
 
 
@@ -69,6 +73,9 @@ class SettingOut(BaseModel):
     api_key: str = ""
     extract_model: str = "qwen2.5vl:7b"
     chat_model: str = "qwen2.5vl:7b"
+    # response_format:json_object 开关。部分模型（如 glm-ocr）开启后输出残缺 JSON，
+    # 依赖 prompt 约束 + 后端 JSON 抽取即可；OpenAI/DashScope 等可开启提升稳定性
+    json_mode: bool = False
 
 
 class SettingTestResponse(BaseModel):

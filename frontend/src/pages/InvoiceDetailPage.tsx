@@ -27,6 +27,8 @@ export default function InvoiceDetailPage() {
           amount_total: res.data.amount_total,
           seller_name: res.data.seller_name,
           buyer_name: res.data.buyer_name,
+          seller_tax_id: res.data.seller_tax_id,
+          buyer_tax_id: res.data.buyer_tax_id,
           remark: res.data.remark,
         })
       } catch (err: any) {
@@ -130,7 +132,13 @@ export default function InvoiceDetailPage() {
             <Form.Item name="seller_name" label="销售方">
               <Input />
             </Form.Item>
+            <Form.Item name="seller_tax_id" label="销售方纳税人识别号">
+              <Input />
+            </Form.Item>
             <Form.Item name="buyer_name" label="购买方">
+              <Input />
+            </Form.Item>
+            <Form.Item name="buyer_tax_id" label="购买方纳税人识别号">
               <Input />
             </Form.Item>
             <Form.Item name="remark" label="备注">

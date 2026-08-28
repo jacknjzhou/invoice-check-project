@@ -37,6 +37,13 @@ OCR 结果按区域分组如下：
 - amount_total: 价税合计/小写金额
 - seller_name: 销售方名称
 - buyer_name: 购买方名称
+- seller_tax_id: 销售方纳税人识别号（大写字母+数字，无空格）
+- buyer_tax_id: 购买方纳税人识别号（同上格式）
+- invoice_number: 右上角"发票号码"（20 位全电 / 8 位老式）。
+  不要把纳税人识别号、身份证号、电子客票号当成发票号码
+- issue_date: 右上角"开票日期"（铁路票乘车日期不是开票日期）
+- amount_ex_tax/tax_amount/amount_total 需满足勾稽：不含税+税额≈价税合计；
+  税额栏为"***"时 tax_amount 填 null；不确定的金额填 null，严禁编造
 - items: 商品/服务明细，数组，每项为 {{"name": "商品名称", "amount": 金额}}
 - remark: 备注栏内容
 
@@ -48,7 +55,7 @@ OCR 结果按区域分组如下：
 5. 票据类型选择：增值税电子普通发票、增值税专用发票、增值税普通发票、火车票、航空行程单、出租车票、网约车行程单、其他
 
 输出示例：
-{{"invoice_type":"增值税电子普通发票","invoice_code":"144032409110","invoice_number":"02203307","issue_date":"2024-01-14","amount_ex_tax":972.45,"tax_amount":58.35,"amount_total":1030.8,"seller_name":"xxx","buyer_name":"yyy","items":[{{"name":"餐饮费","amount":972.45}}],"remark":null}}
+{{"invoice_type":"增值税电子普通发票","invoice_code":"144032409110","invoice_number":"02203307","issue_date":"2024-01-14","amount_ex_tax":972.45,"tax_amount":58.35,"amount_total":1030.8,"seller_name":"xxx","buyer_name":"yyy","seller_tax_id":"91440300MA5XXXXX0Y","buyer_tax_id":"91440300MA5YYYYY9X","items":[{{"name":"餐饮费","amount":972.45}}],"remark":null}}
 """
 
 
@@ -65,27 +72,41 @@ def _parse_json(raw: str) -> dict | None:
         return obj if isinstance(obj, dict) else None
     except json.JSONDecodeError:
         pass
-    start = text.find("{")
-    end = text.rfind("}")
-    if start != -1 and end > start:
+    # 兜底：抓取第一个完整的 JSON 对象（平衡大括号，兼容重复输出多块）
+    from .client import _snip_json
+    snipped = _snip_json(text)
+    if snipped:
         try:
-            obj = json.loads(text[start : end + 1])
+            obj = json.loads(snipped)
             return obj if isinstance(obj, dict) else None
         except json.JSONDecodeError:
             return None
     return None
 
 
-async def extract_with_ocr(img_path: Path) -> dict:
+async def extract_with_ocr(
+    img_path: Path,
+    *,
+    cfg: dict | None = None,
+    model: str | None = None,
+    return_raw: bool = False,
+) -> dict | tuple[dict, str]:
     """OCR + LLM 混合识别入口。
 
     流程：
     1. RapidOCR 提取文字和坐标
     2. 按位置分组（右上角、中部、底部）
     3. LLM 根据结构化 OCR 结果输出 JSON
+
+    return_raw=True 时返回 (parsed, raw) 元组。
+    默认使用配置中的 extract_model（而非 chat_model）。
     """
     if not check_paddleocr():
         raise RuntimeError("RapidOCR 未安装，无法使用 OCR 模式")
+
+    if cfg is None:
+        from .client import get_llm_config
+        cfg = get_llm_config()
 
     # 1. 构建 OCR 上下文
     ocr_context = build_ocr_context(img_path)
@@ -98,8 +119,11 @@ async def extract_with_ocr(img_path: Path) -> dict:
 
     raw = await chat_completion(
         messages,
+        cfg=cfg,
+        model=model or cfg.get("extract_model"),
         temperature=0.0,
         max_tokens=4096,  # 留足 buffer，避免 reasoning 模型（gemma4 等）被截断
+        json_mode=True,
     )
     logger.info("OCR+LLM 模式 LLM 原始输出:\n%s", raw)
 
@@ -109,4 +133,4 @@ async def extract_with_ocr(img_path: Path) -> dict:
         raise RuntimeError(f"JSON 解析失败: {raw[:200]}")
 
     logger.info("OCR+LLM 模式解析结果:\n%s", json.dumps(parsed, ensure_ascii=False, indent=2))
-    return parsed
+    return (parsed, raw) if return_raw else parsed
