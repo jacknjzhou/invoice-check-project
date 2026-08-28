@@ -23,6 +23,7 @@ wheels/
 .installed.cfg
 *.egg
 .trae/
+invoice-docs/
 # Node
 node_modules/
 npm-debug.log*

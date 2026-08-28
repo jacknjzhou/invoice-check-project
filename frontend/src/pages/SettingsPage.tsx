@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react'
-import { Card, Form, Input, Select, Button, message, Space } from 'antd'
+import { Card, Form, Input, Select, Button, message, Space, Switch, Alert } from 'antd'
 import { SaveOutlined, ApiOutlined } from '@ant-design/icons'
 import { getSettings, updateSettings, testConnection, type Setting } from '../api'
 
@@ -73,6 +73,27 @@ export default function SettingsPage() {
         </Form.Item>
         <Form.Item name="chat_model" label="对话模型">
           <Input placeholder="qwen2.5vl:7b" />
+        </Form.Item>
+        <Form.Item
+          name="json_mode"
+          label="强制 JSON 输出（response_format: json_object）"
+          valuePropName="checked"
+          extra="OpenAI/DashScope 等云端模型建议开启；部分本地模型（如 glm-ocr）开启后输出残缺，保持关闭"
+        >
+          <Switch />
+        </Form.Item>
+        <Form.Item noStyle shouldUpdate={(p, c) => p.json_mode !== c.json_mode}>
+          {({ getFieldValue }) =>
+            getFieldValue('json_mode') ? (
+              <Form.Item>
+                <Alert
+                  type="warning"
+                  showIcon
+                  message="若更换模型后识别字段大量缺失或错位，请先尝试关闭此开关"
+                />
+              </Form.Item>
+            ) : null
+          }
         </Form.Item>
         <Form.Item>
           <Space>

@@ -39,6 +39,11 @@ OCR 结果按区域分组如下：
 - buyer_name: 购买方名称
 - seller_tax_id: 销售方纳税人识别号（大写字母+数字，无空格）
 - buyer_tax_id: 购买方纳税人识别号（同上格式）
+- invoice_number: 右上角"发票号码"（20 位全电 / 8 位老式）。
+  不要把纳税人识别号、身份证号、电子客票号当成发票号码
+- issue_date: 右上角"开票日期"（铁路票乘车日期不是开票日期）
+- amount_ex_tax/tax_amount/amount_total 需满足勾稽：不含税+税额≈价税合计；
+  税额栏为"***"时 tax_amount 填 null；不确定的金额填 null，严禁编造
 - items: 商品/服务明细，数组，每项为 {{"name": "商品名称", "amount": 金额}}
 - remark: 备注栏内容
 
@@ -67,11 +72,12 @@ def _parse_json(raw: str) -> dict | None:
         return obj if isinstance(obj, dict) else None
     except json.JSONDecodeError:
         pass
-    start = text.find("{")
-    end = text.rfind("}")
-    if start != -1 and end > start:
+    # 兜底：抓取第一个完整的 JSON 对象（平衡大括号，兼容重复输出多块）
+    from .client import _snip_json
+    snipped = _snip_json(text)
+    if snipped:
         try:
-            obj = json.loads(text[start : end + 1])
+            obj = json.loads(snipped)
             return obj if isinstance(obj, dict) else None
         except json.JSONDecodeError:
             return None

@@ -117,40 +117,38 @@ def validate_and_fix_fields(fields: dict) -> dict:
                 continue
         # 如果所有格式都失败，保留原始值（不置空）
     
-    # 2. 发票代码/号码格式校验 - 提取数字，放宽位数限制
+    # 2. 发票代码/号码格式校验
+    # 中国发票代码：10/12 位（全电发票无代码）；发票号码：8 位（纸质/早期电子）
+    # 或 20 位（全电）。位数不对说明模型张冠李戴（常见：把纳税人识别号、
+    # 身份证号、电子客票号当成发票号码），置空以触发 QR 锚点补齐/二次提取，
+    # 绝不能带错值入库（会污染查重）。
     if fields.get("invoice_code"):
         original_code = str(fields["invoice_code"])
-        # 移除所有非数字字符（空格、连字符、点等）
         code = re.sub(r"[^\d]", "", original_code)
-        # 标准位数：10位、12位、20位
-        if len(code) in (10, 12, 20):
+        if len(code) in (10, 12):
             fields["invoice_code"] = code
             if code != original_code:
                 logger.info("发票代码清洗: '%s' -> '%s'", original_code, code)
-        elif len(code) >= 8:
-            # 放宽到 8-20 位，保留提取的数字
-            fields["invoice_code"] = code
-            logger.warning("发票代码位数非标准(%d位): '%s' -> '%s'", len(code), original_code, code)
         else:
-            # 位数太少，可能识别错误，保留原值
-            logger.warning("发票代码位数过少(%d位)，保留原值: '%s'", len(code), original_code)
-    
+            logger.warning(
+                "发票代码位数非标准(%d位): '%s'，置空待 QR/二次提取修正",
+                len(code), original_code,
+            )
+            fields["invoice_code"] = None
+
     if fields.get("invoice_number"):
         original_number = str(fields["invoice_number"])
-        # 移除所有非数字字符
         number = re.sub(r"[^\d]", "", original_number)
-        # 标准位数：8位、20位
         if len(number) in (8, 20):
             fields["invoice_number"] = number
             if number != original_number:
                 logger.info("发票号码清洗: '%s' -> '%s'", original_number, number)
-        elif len(number) >= 6:
-            # 放宽到 6-20 位，保留提取的数字
-            fields["invoice_number"] = number
-            logger.warning("发票号码位数非标准(%d位): '%s' -> '%s'", len(number), original_number, number)
         else:
-            # 位数太少，可能识别错误，保留原值
-            logger.warning("发票号码位数过少(%d位)，保留原值: '%s'", len(number), original_number)
+            logger.warning(
+                "发票号码位数非标准(%d位): '%s'，置空待 QR/二次提取修正",
+                len(number), original_number,
+            )
+            fields["invoice_number"] = None
     
     # 3. 金额字段清洗（去除逗号、空格等）
     for key in ["amount_ex_tax", "tax_amount", "amount_total"]:
@@ -170,29 +168,61 @@ def validate_and_fix_fields(fields: dict) -> dict:
                 logger.info("纳税人识别号清洗 %s: '%s' -> '%s'", key, fields[key], cleaned)
             fields[key] = cleaned
     
-    # 4. 金额勾稽校验：仅记录警告，不修改原值
+    # 4. 金额勾稽校验 + 规则化修复
+    # 实测模型常见错误：ex_tax=tax=total 照抄、金额幻觉（填 100 等）。
+    # 以价税合计（可被 QR 锚定，最可信）为基准，按规则修复明显错值，
+    # 修复不了的保留不一致（由 sanity 触发二次提取/人工复核）。
     ex_tax = fields.get("amount_ex_tax")
     tax = fields.get("tax_amount")
     total = fields.get("amount_total")
-    
-    if ex_tax is not None and tax is not None and total is not None:
-        calculated = ex_tax + tax
-        diff = abs(calculated - total)
-        # 允许 ±0.5 误差
-        if diff > 0.5:
-            logger.warning(
-                "金额勾稽不一致: %.2f + %.2f = %.2f ≠ %.2f (差 %.2f)",
-                ex_tax, tax, calculated, total, diff
-            )
-    
+
+    def _num(v):
+        return isinstance(v, (int, float))
+
+    if _num(ex_tax) and _num(total) and ex_tax > total:
+        # 不含税金额不可能大于价税合计：模型幻觉/错位，置空待重取
+        logger.warning("不含税金额 %.2f > 价税合计 %.2f，置空", ex_tax, total)
+        fields["amount_ex_tax"] = None
+        ex_tax = None
+    if _num(tax) and _num(total) and (tax < 0 or tax > total):
+        # 税额为负或超过合计（如免税票税额被照抄成合计值）：置空
+        logger.warning("税额 %.2f 非法（应为 0~合计），置空", tax)
+        fields["tax_amount"] = None
+        tax = None
+
+    ex_tax, tax = fields.get("amount_ex_tax"), fields.get("tax_amount")
+    if _num(ex_tax) and _num(tax) and _num(total) and abs(ex_tax + tax - total) > 0.5:
+        if abs(ex_tax - total) < 0.01 and abs(tax - total) < 0.01:
+            # ex_tax = tax = total：免税/未显示税额票，税额被照抄，置空
+            logger.warning("税额与合计相同（照抄模式），置空税额")
+            fields["tax_amount"] = None
+        else:
+            # 税额看起来合理（0 < tax < total）但不含税对不上：用合计-税额反推
+            if 0 < tax < total and abs((total - tax) - ex_tax) > 0.5:
+                fixed = round(total - tax, 2)
+                logger.warning(
+                    "勾稽不一致，按 合计-税额 反推不含税: %.2f -> %.2f", ex_tax, fixed
+                )
+                fields["amount_ex_tax"] = fixed
+
+    # 4.5 税额缺失但有不含税与合计的差额：增值税发票必有税额，反推补齐
+    # （免税票 ex_tax == total，差额为 0 不会触发）
+    if fields.get("tax_amount") in (None, 0):
+        ex_tax, total = fields.get("amount_ex_tax"), fields.get("amount_total")
+        if _num(ex_tax) and _num(total):
+            gap = round(total - ex_tax, 2)
+            if 0 < gap < total:
+                logger.warning("税额缺失，按 合计-不含税 反推: %.2f", gap)
+                fields["tax_amount"] = gap
+
     # 5. 如果只有不含税金额和税额，没有价税合计，自动计算
-    if total is None and ex_tax is not None and tax is not None:
-        fields["amount_total"] = round(ex_tax + tax, 2)
-    
+    if fields.get("amount_total") is None and fields.get("amount_ex_tax") is not None and fields.get("tax_amount") is not None:
+        fields["amount_total"] = round(fields["amount_ex_tax"] + fields["tax_amount"], 2)
+
     # 6. 如果只有价税合计和税额，反推不含税金额
-    if ex_tax is None and total is not None and tax is not None:
-        fields["amount_ex_tax"] = round(total - tax, 2)
-    
+    if fields.get("amount_ex_tax") is None and fields.get("amount_total") is not None and fields.get("tax_amount") is not None:
+        fields["amount_ex_tax"] = round(fields["amount_total"] - fields["tax_amount"], 2)
+
     return fields
 
 
@@ -357,8 +387,8 @@ async def extract_invoice_fields(
         b64, mime = image_to_b64(img_path)
         return await extract_invoice(b64, mime, cfg=cfg, model=model, return_raw=True)
 
-    async def merge_all(pages: list[Path]) -> tuple[dict, list]:
-        """逐页提取 → 合并 → QR 校正 → 清洗校验。返回 (merged, raws)。"""
+    async def merge_all(pages: list[Path]) -> tuple[dict, list, dict | None]:
+        """逐页提取 → 合并 → QR 校正 → 清洗校验。返回 (merged, raws, qr)。"""
         results, raws = [], []
         for img_path in pages:
             try:
@@ -375,7 +405,7 @@ async def extract_invoice_fields(
 
         # QR 码锚点校验/修正（机器可读数据源，优先级高于 OCR/LLM 提取）
         try:
-            qr = decode_invoice_qr(img_paths[0])
+            qr = decode_invoice_qr(pages[0])
         except Exception as qr_err:
             logger.warning("QR 解码异常: %s", qr_err)
             qr = None
@@ -383,10 +413,13 @@ async def extract_invoice_fields(
             merged = apply_qr_anchor(merged, qr)
 
         merged = validate_and_fix_fields(merged)
-        return merged, raws
+        # validate 会把位数不合法的代码/号码置空，再用 QR 补齐一次
+        if qr:
+            merged = apply_qr_anchor(merged, qr)
+        return merged, raws, qr
 
     logger.info("开始提取 %s，模式: %s", file_path.name, "OCR+LLM" if use_ocr else "纯视觉")
-    merged, raws = await merge_all(img_paths)
+    merged, raws, qr = await merge_all(img_paths)
 
     # 完整性自检；失败时用另一通道（视觉模型）二次提取交叉校验
     issues = check_fields_sanity(merged)
@@ -405,6 +438,8 @@ async def extract_invoice_fields(
 
         second_merged = merge_extracted_fields(second_results)
         second_merged = validate_and_fix_fields(second_merged)
+        if qr:
+            second_merged = apply_qr_anchor(second_merged, qr)
         second_issues = check_fields_sanity(second_merged)
 
         if len(second_issues) < len(issues):
@@ -512,19 +547,29 @@ async def process_invoice(invoice_id: int) -> None:
 
     except Exception as e:
         logger.exception("处理发票 %d 失败", invoice_id)
-        inv = db.query(Invoice).filter(Invoice.id == invoice_id).first()
-        if inv:
-            inv.status = "error"
-            inv.error_msg = str(e)
-            db.commit()
+        try:
+            # 数据库异常后 session 处于失效事务状态，必须先 rollback
+            # 才能继续操作（否则抛 PendingRollbackError）
+            db.rollback()
+            inv = db.query(Invoice).filter(Invoice.id == invoice_id).first()
+            if inv:
+                inv.status = "error"
+                inv.error_msg = str(e)[:500]
+                db.commit()
+        except Exception:
+            # 数据库本身不可用（如 Postgres 重启）时无法写状态，等待下次重试
+            logger.exception("发票 %d 状态更新失败（数据库不可用）", invoice_id)
     finally:
         db.close()
 
 
 async def process_invoice_queue(invoice_ids: list[int]) -> None:
-    """串行处理队列中的发票（避免本地模型并发过载）。"""
+    """串行处理队列中的发票（避免本地模型并发过载）。单张失败不中断队列。"""
     for inv_id in invoice_ids:
-        await process_invoice(inv_id)
+        try:
+            await process_invoice(inv_id)
+        except Exception:
+            logger.exception("队列处理发票 %d 异常，继续处理下一张", inv_id)
 
 
 def schedule_processing(invoice_ids: list[int]) -> None:

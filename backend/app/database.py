@@ -9,6 +9,7 @@ engine = create_engine(
     pool_pre_ping=True,
     pool_size=10,
     max_overflow=20,
+    pool_recycle=1800,  # 回收长连接，避免 Postgres 重启/网络 NAT 超时后的僵死连接
 )
 SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
 

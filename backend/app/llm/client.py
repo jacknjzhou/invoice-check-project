@@ -16,15 +16,35 @@ logger = logging.getLogger(__name__)
 
 
 def _snip_json(text: str) -> str | None:
-    """从文本中截取第一个 { 到最后一个 } 的 JSON 片段。
+    """截取第一个完整的 JSON 对象（平衡大括号），容忍 markdown 代码块与重复输出。
 
-    用于 reasoning 类模型：思考过程里若包含最终 JSON，
-    只返回该片段；不含 JSON 则返回 None。
+    不能用 first-{ 到 last-} 截取：模型重复输出多个 JSON 块时，
+    跨块截取会产生非法 JSON。
     """
     start = text.find("{")
-    end = text.rfind("}")
-    if start != -1 and end > start:
-        return text[start : end + 1]
+    if start == -1:
+        return None
+    depth = 0
+    in_str = False
+    esc = False
+    for i in range(start, len(text)):
+        c = text[i]
+        if in_str:
+            if esc:
+                esc = False
+            elif c == "\\":
+                esc = True
+            elif c == '"':
+                in_str = False
+            continue
+        if c == '"':
+            in_str = True
+        elif c == "{":
+            depth += 1
+        elif c == "}":
+            depth -= 1
+            if depth == 0:
+                return text[start:i + 1]
     return None
 
 
@@ -59,6 +79,7 @@ DEFAULTS = {
     "api_key": "",
     "extract_model": "qwen2.5vl:7b",
     "chat_model": "qwen2.5vl:7b",
+    "json_mode": "0",  # response_format:json_object 开关；部分模型（glm-ocr 等）开启后输出残缺
 }
 
 CLOUD_PRESETS = {
@@ -121,6 +142,7 @@ async def chat_completion(
     timeout: float = 180.0,
     retries: int = 2,
     json_mode: bool = False,
+    frequency_penalty: float | None = None,
 ) -> str:
     """调用 OpenAI 兼容 chat 接口，返回文本内容。失败抛出 RuntimeError。
 
@@ -140,7 +162,7 @@ async def chat_completion(
     if cfg.get("api_key"):
         headers["Authorization"] = f"Bearer {cfg['api_key']}"
 
-    use_response_format = json_mode
+    use_response_format = json_mode and str(cfg.get("json_mode", "0")).lower() in ("1", "true")
     last_err: Exception | None = None
     for attempt in range(retries + 1):
         payload: dict = {
@@ -151,6 +173,9 @@ async def chat_completion(
         }
         if use_response_format:
             payload["response_format"] = {"type": "json_object"}
+        if frequency_penalty is not None:
+            # 用于打破病态重复输出（部分本地模型对某些图会无限重复同一 JSON）
+            payload["frequency_penalty"] = frequency_penalty
         try:
             async with httpx.AsyncClient(timeout=timeout) as client:
                 resp = await client.post(url, headers=headers, json=payload)
