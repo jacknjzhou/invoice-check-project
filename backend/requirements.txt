@@ -1,0 +1,18 @@
+fastapi>=0.110
+uvicorn[standard]>=0.29
+sqlalchemy>=2.0
+pydantic>=2.6
+pydantic-settings>=2.2
+httpx>=0.27
+python-multipart>=0.0.9
+openpyxl>=3.1
+pdf2image>=1.17
+pillow>=10.0
+aiofiles>=23.2
+psycopg2-binary>=2.9
+# OCR：使用 RapidOCR（基于 ONNX Runtime），跨架构稳定，无需 PaddlePaddle
+# 解决 PaddlePaddle 3.x 在 aarch64 (Apple Silicon Docker) 上的 C++ 段错误问题
+rapidocr-onnxruntime>=1.4
+# 系统依赖（需单独安装）
+# macOS: brew install poppler
+# Ubuntu/Debian: apt-get install poppler-utils libgl1 libglib2.0-0 libxcb1
